@@ -4,6 +4,8 @@ go 1.22.5
 
 require (
 	github.com/docker/docker v27.5.1+incompatible
+	github.com/gorilla/mux v1.8.1
+	github.com/gorilla/rpc v1.2.1
 	github.com/tmc/langchaingo v0.1.12
 )
 
