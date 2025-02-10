@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"net/http"
+	"net"
+	"net/rpc"
+	"net/rpc/jsonrpc"
 	"os"
 	"time"
 
@@ -15,33 +18,14 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/openai"
+
+	"santoshkal/mcp-godocker/types" // Import the shared package
 )
 
 // Server represents the Docker server application.
 type Server struct {
 	dockerClient *client.Client
 	llm          *openai.LLM
-}
-
-// Prompt represents a prompt that the server can handle.
-type Prompt struct {
-	Name        string           `json:"name"`
-	Description string           `json:"description"`
-	Arguments   []PromptArgument `json:"arguments"`
-}
-
-// PromptArgument represents an argument for a prompt.
-type PromptArgument struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Required    bool   `json:"required"`
-}
-
-// Tool represents a tool that the server can execute.
-type Tool struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema interface{} `json:"input_schema"`
 }
 
 // NewServer creates a new Server instance.
@@ -57,7 +41,7 @@ func NewServer() (*Server, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("OPENAI_API_KEY environment variable not set")
 	}
-	llm, err := openai.New(openai.WithToken(apiKey), openai.WithModel("gpt-4o"))
+	llm, err := openai.New(openai.WithToken(apiKey), openai.WithModel("gpt-4"))
 	if err != nil {
 		return nil, err
 	}
@@ -66,12 +50,12 @@ func NewServer() (*Server, error) {
 }
 
 // ListPrompts returns a list of available prompts.
-func (s *Server) ListPrompts() []Prompt {
-	return []Prompt{
+func (s *Server) ListPrompts(args *struct{}, reply *[]types.Prompt) error {
+	*reply = []types.Prompt{
 		{
 			Name:        "docker_compose",
 			Description: "Treat the LLM like a Docker Compose manager",
-			Arguments: []PromptArgument{
+			Arguments: []types.PromptArgument{
 				{
 					Name:        "name",
 					Description: "Unique name of the project",
@@ -85,10 +69,11 @@ func (s *Server) ListPrompts() []Prompt {
 			},
 		},
 	}
+	return nil
 }
 
 // CallLLM sends a user input to the OpenAI LLM and returns the generated plan.
-func (s *Server) CallLLM(userInput string) (string, error) {
+func (s *Server) CallLLM(args *string, reply *string) error {
 	sp := `
 You are a Docker Compose manager. Generate a plan to: %s
 
@@ -107,23 +92,24 @@ Example response:
 
 	prompt := []llms.MessageContent{
 		llms.TextParts(llms.ChatMessageTypeSystem, sp),
-		llms.TextParts(llms.ChatMessageTypeHuman, userInput),
+		llms.TextParts(llms.ChatMessageTypeHuman, *args),
 	}
 	// Call the OpenAI LLM.
 	response, err := s.llm.GenerateContent(context.Background(), prompt, llms.WithJSONMode())
 	if err != nil {
-		return "", err
+		return err
 	}
-	return response.Choices[0].Content, nil
+	*reply = response.Choices[0].Content
+	return nil
 }
 
 // ExecutePlan processes and executes the plan with proper Docker SDK calls.
-func (s *Server) ExecutePlan(plan string) (string, error) {
+func (s *Server) ExecutePlan(args *string, reply *string) error {
 	var response struct {
 		Plan []map[string]interface{} `json:"plan"`
 	}
-	if err := json.Unmarshal([]byte(plan), &response); err != nil {
-		return "", fmt.Errorf("failed to unmarshal plan: %v. Plan: %s", err, plan)
+	if err := json.Unmarshal([]byte(*args), &response); err != nil {
+		return fmt.Errorf("failed to unmarshal plan: %v. Plan: %s", err, *args)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -135,42 +121,42 @@ func (s *Server) ExecutePlan(plan string) (string, error) {
 		case "create_network":
 			name, ok := action["name"].(string)
 			if !ok || name == "" {
-				return "", fmt.Errorf("invalid or missing name for create_network action")
+				return errors.New("invalid or missing name for create_network action")
 			}
 			_, err := s.dockerClient.NetworkCreate(ctx, name, network.CreateOptions{})
 			if err != nil {
-				return "", fmt.Errorf("failed to create network %s: %v", name, err)
+				return fmt.Errorf("failed to create network %s: %v", name, err)
 			}
 
 		case "create_volume":
 			name, ok := action["name"].(string)
 			if !ok || name == "" {
-				return "", fmt.Errorf("invalid or missing name for create_volume action")
+				return errors.New("invalid or missing name for create_volume action")
 			}
 			_, err := s.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: name})
 			if err != nil {
-				return "", fmt.Errorf("failed to create volume %s: %v", name, err)
+				return fmt.Errorf("failed to create volume %s: %v", name, err)
 			}
 
 		case "create_container":
 			name, image, err := parseContainerDetails(action)
 			if err != nil {
-				return "", err
+				return err
 			}
 
 			envVars, err := parseEnvironment(action)
 			if err != nil {
-				return "", err
+				return err
 			}
 
 			volumes, err := parseVolumes(action)
 			if err != nil {
-				return "", err
+				return err
 			}
 
 			networks, err := parseNetworks(action)
 			if err != nil {
-				return "", err
+				return err
 			}
 
 			config := container.Config{
@@ -189,45 +175,45 @@ func (s *Server) ExecutePlan(plan string) (string, error) {
 
 			_, err = s.dockerClient.ContainerCreate(ctx, &config, &hostConfig, &networkingConfig, nil, name)
 			if err != nil {
-				return "", fmt.Errorf("failed to create container %s: %v", name, err)
+				return fmt.Errorf("failed to create container %s: %v", name, err)
 			}
 
 		case "run_container":
 			name, ok := action["name"].(string)
 			if !ok {
-				return "", fmt.Errorf("invalid name for run_container action: %v", action["name"])
+				return fmt.Errorf("invalid name for run_container action: %v", action["name"])
 			}
 
 			ctx := context.Background()
 			containerJSON, err := s.dockerClient.ContainerInspect(ctx, name)
 			if err != nil {
-				return "", fmt.Errorf("failed to inspect container %s: %v", name, err)
+				return fmt.Errorf("failed to inspect container %s: %v", name, err)
 			}
 
 			if !containerJSON.State.Running {
 				if err := s.dockerClient.ContainerStart(ctx, containerJSON.ID, container.StartOptions{}); err != nil {
-					return "", fmt.Errorf("failed to start container %s: %v", name, err)
+					return fmt.Errorf("failed to start container %s: %v", name, err)
 				}
 			}
 
 		default:
-			return "", fmt.Errorf("unknown action: %s", action["action"])
+			return fmt.Errorf("unknown action: %s", action["action"])
 		}
 	}
 
-	fmt.Printf("Devised Plan: %s\n", plan)
-	return `{"status": "success", "message": "Plan executed successfully"}`, nil
+	*reply = `{"status": "success", "message": "Plan executed successfully"}`
+	return nil
 }
 
 // parseContainerDetails extracts container details from action.
 func parseContainerDetails(action map[string]interface{}) (string, string, error) {
 	name, ok := action["name"].(string)
 	if !ok || name == "" {
-		return "", "", fmt.Errorf("invalid or missing container name")
+		return "", "", errors.New("invalid or missing container name")
 	}
 	image, ok := action["image"].(string)
 	if !ok || image == "" {
-		return "", "", fmt.Errorf("invalid or missing container image")
+		return "", "", errors.New("invalid or missing container image")
 	}
 	return name, image, nil
 }
@@ -273,53 +259,36 @@ func parseNetworks(action map[string]interface{}) ([]string, error) {
 	return networks, nil
 }
 
-// HTTP Handlers
-
-func (s *Server) handleListPrompts(w http.ResponseWriter, r *http.Request) {
-	prompts := s.ListPrompts()
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(toJSON(prompts)))
-}
-
-func (s *Server) handleUserInput(w http.ResponseWriter, r *http.Request) {
-	userInput := r.URL.Query().Get("input")
-	plan, err := s.CallLLM(userInput)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Execute the plan using the MCP protocol.
-	response, err := s.ExecutePlan(plan)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(response))
-}
-
-// toJSON converts a Go object to a JSON string.
-func toJSON(v interface{}) string {
-	bytes, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return fmt.Sprintf(`{"error": "%s"}`, err.Error())
-	}
-	return string(bytes)
-}
-
-func main() {
+// StartRPCServer starts the JSON-RPC server.
+func StartRPCServer() {
 	server, err := NewServer()
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
 	}
 
-	http.HandleFunc("/list-prompts", server.handleListPrompts)
-	http.HandleFunc("/user-input", server.handleUserInput)
+	rpcServer := rpc.NewServer()
+	rpcServer.Register(server)
 
-	log.Println("Starting server on :1234...")
-	if err := http.ListenAndServe(":1234", nil); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	listener, err := net.Listen("tcp", ":1234")
+	if err != nil {
+		log.Fatalf("Failed to start RPC server: %v", err)
 	}
+	defer listener.Close()
+
+	log.Println("RPC server is listening on port 1234...")
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Error accepting connection: %v", err)
+			continue
+		}
+		go rpcServer.ServeCodec(jsonrpc.NewServerCodec(conn))
+	}
+}
+
+func main() {
+	go StartRPCServer()
+
+	// Keep the main goroutine alive.
+	select {}
 }
