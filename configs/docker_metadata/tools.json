@@ -1,0 +1,23 @@
+[
+  {
+    "Type": "function",
+    "Function": {
+      "Name": "executeDockerOperation",
+      "Description": "Execute a Docker operation such as create_container, create_network, create_volume, or pull_image.",
+      "Parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "The Docker action to perform (e.g., create_container, create_network, create_volume, pull_image)."
+          },
+          "parameters": {
+            "type": "object",
+            "description": "Parameters required for the specified Docker action."
+          }
+        },
+        "required": ["action", "parameters"]
+      }
+    }
+  }
+]

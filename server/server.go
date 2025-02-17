@@ -1,3 +1,5 @@
+// server.go
+
 package main
 
 import (
@@ -14,30 +16,50 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	img "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/openai"
 
-	"santoshkal/mcp-godocker/types" // Shared package with Prompt definitions, etc.
+	"santoshkal/mcp-godocker/pkg/mcp"
+	"santoshkal/mcp-godocker/utils"
 )
+
+// -----------------------------------------------------------------------------
+// Tool registration types and helper methods
+// -----------------------------------------------------------------------------
+
+// ToolHandler defines the function signature for tool execution.
+type ToolHandler func(ctx context.Context, s *Server, parameters map[string]interface{}) error
+
+// RegisteredTool holds metadata and the handler for a tool.
+type RegisteredTool struct {
+	Name        string
+	Description string
+	InputSchema map[string]interface{}
+	Handler     ToolHandler
+}
+
+// -----------------------------------------------------------------------------
+// Server definition including tool registry
+// -----------------------------------------------------------------------------
 
 // Server represents the Docker server application.
 type Server struct {
 	dockerClient *client.Client
 	llm          *openai.LLM
+	tools        map[string]RegisteredTool
 }
 
-// NewServer creates a new Server instance.
+// NewServer creates a new Server instance and registers built-in tools.
 func NewServer() (*Server, error) {
-	// Initialize Docker client.
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, err
 	}
 
-	// Initialize OpenAI LLM.
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		return nil, fmt.Errorf("OPENAI_API_KEY environment variable not set")
@@ -47,106 +69,113 @@ func NewServer() (*Server, error) {
 		return nil, err
 	}
 
-	return &Server{dockerClient: dockerClient, llm: llm}, nil
-}
+	s := &Server{
+		dockerClient: dockerClient,
+		llm:          llm,
+		tools:        make(map[string]RegisteredTool),
+	}
 
-// ListPrompts returns a list of available prompts.
-// net/rpc expects the method signature to be:
-//
-//	func (s *Server) SomeMethod(args *SomeType, reply *SomeType) error
-//
-// Here, we ignore `args` (it’s just a placeholder struct{}).
-func (s *Server) ListPrompts(args *struct{}, reply *[]types.Prompt) error {
-	*reply = []types.Prompt{
-		{
-			Name:        "docker_compose",
-			Description: "Treat the LLM like a Docker Compose manager",
-			Arguments: []types.PromptArgument{
-				{Name: "name", Description: "Unique name of the project", Required: true},
-				{Name: "containers", Description: "Describe containers you want", Required: true},
+	// Register built-in Docker operation tools.
+	s.RegisterTool("create_network", "Create a Docker network", map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"name": map[string]interface{}{
+				"type":        "string",
+				"description": "Name of the network",
 			},
 		},
-	}
-	return nil
+		"required": []string{"name"},
+	}, createNetworkHandler)
+
+	s.RegisterTool("create_container", "Create a Docker container", map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"name": map[string]interface{}{
+				"type":        "string",
+				"description": "Name of the container",
+			},
+			"image": map[string]interface{}{
+				"type":        "string",
+				"description": "Docker image to use",
+			},
+		},
+		"required": []string{"name", "image"},
+	}, createContainerHandler)
+
+	s.RegisterTool("create_volume", "Create a Docker volume", map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"name": map[string]interface{}{
+				"type":        "string",
+				"description": "Name of the volume",
+			},
+		},
+		"required": []string{"name"},
+	}, createVolumeHandler)
+
+	s.RegisterTool("run_container", "Run (start) a Docker container", map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"name": map[string]interface{}{
+				"type":        "string",
+				"description": "Name of the container",
+			},
+		},
+		"required": []string{"name"},
+	}, runContainerHandler)
+
+	s.RegisterTool("pull_image", "Pull a Docker image", map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"image": map[string]interface{}{
+				"type":        "string",
+				"description": "Name of the image to pull",
+			},
+		},
+		"required": []string{"image"},
+	}, pullImageHandler)
+
+	return s, nil
 }
 
-// CallLLM sends a user input to the OpenAI LLM and returns the generated plan.
-// The client would call it with one string argument and get one string reply:
-//
-//	callRPC("Server.CallLLM", "Your input to LLM")
+// RegisterTool adds a new tool with its metadata and handler to the server.
+func (s *Server) RegisterTool(name, description string, inputSchema map[string]interface{}, handler ToolHandler) {
+	s.tools[name] = RegisteredTool{
+		Name:        name,
+		Description: description,
+		InputSchema: inputSchema,
+		Handler:     handler,
+	}
+}
+
+// -----------------------------------------------------------------------------
+// LLM and Plan Execution Methods
+// -----------------------------------------------------------------------------
+
+// CallLLM sends user input to the OpenAI LLM and returns the generated plan (JSON).
 func (s *Server) CallLLM(args *string, reply *string) error {
 	log.Printf("[CallLLM] Received user input: %s", *args)
 
-	// Define strict JSON format for LLM response
-	promptTemplate := `
-You are an AI that generates structured JSON plans for Docker automation.
-Always return a valid JSON array of actions.
-	Follow these guidelines:
-1. Use the MCP protocol to manage Docker resources.
-2. Provide a step-by-step plan in JSON format as an array of actions.
-3. Do not pull any image, use existing image tagged as 'latest' available locally.
-4. Include only valid Docker actions (e.g., create_container, run_container).
-
----
-Example Response:
-[
-    {
-        "action": "create_network",
-        "parameters": {
-            "name": "mysql_network",
-            "driver": "bridge"
-        }
-    },
-    {
-        "action": "create_volume",
-        "parameters": {
-            "name": "mysql_data"
-        }
-    },
-    {
-        "action": "create_container",
-        "parameters": {
-            "name": "mysql_container",
-            "image": "mysql:latest",
-            "environment": {
-                "MYSQL_ROOT_PASSWORD": "rootpassword",
-                "MYSQL_DATABASE": "exampledb",
-                "MYSQL_USER": "exampleuser",
-                "MYSQL_PASSWORD": "examplepass"
-            },
-            "volumes": [
-                {
-                    "source": "mysql_data",
-                    "target": "/var/lib/mysql"
-                }
-            ],
-            "networks": [
-                "mysql_network"
-            ],
-            "ports": [
-                {
-                    "published": 3306,
-                    "target": 3306
-                }
-            ]
-        }
-    },
-    {
-        "action": "run_container",
-        "parameters": {
-            "name": "mysql_container"
-        }
-    }
-]
----
-Do not include explanations. Do not return Markdown. Just return JSON.
-`
-	prompt := []llms.MessageContent{
-		llms.TextParts(llms.ChatMessageTypeSystem, fmt.Sprintf(promptTemplate, *args)),
-		llms.TextParts(llms.ChatMessageTypeHuman, *args),
+	// Generate a list of tools from the registered tools.
+	var registeredTools []llms.Tool
+	for _, tool := range s.tools {
+		registeredTools = append(registeredTools, llms.Tool{
+			Type: "function",
+			Function: &llms.FunctionDefinition{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  tool.InputSchema,
+			},
+		})
 	}
 
-	response, err := s.llm.GenerateContent(context.Background(), prompt)
+	// Build the prompt using the user instruction and system prompt.
+	prompt := []llms.MessageContent{
+		llms.TextParts(llms.ChatMessageTypeHuman, *args),
+		llms.TextParts(llms.ChatMessageTypeSystem, utils.GetSystemPrompt()),
+	}
+
+	response, err := s.llm.GenerateContent(context.Background(), prompt, llms.WithTools(registeredTools))
 	if err != nil {
 		log.Printf("[CallLLM] OpenAI error: %v", err)
 		return fmt.Errorf("CallLLM OpenAI API error: %w", err)
@@ -157,14 +186,12 @@ Do not include explanations. Do not return Markdown. Just return JSON.
 		return fmt.Errorf("CallLLM received an empty response from OpenAI")
 	}
 
-	// Ensure response is valid JSON
 	var plan []map[string]interface{}
 	if err := json.Unmarshal([]byte(response.Choices[0].Content), &plan); err != nil {
 		log.Printf("[CallLLM] LLM response is not valid JSON: %v", err)
 		return fmt.Errorf("CallLLM returned invalid JSON: %w", err)
 	}
 
-	// Convert structured response back to JSON string
 	planBytes, err := json.Marshal(plan)
 	if err != nil {
 		log.Printf("[CallLLM] Failed to marshal plan: %v", err)
@@ -176,11 +203,17 @@ Do not include explanations. Do not return Markdown. Just return JSON.
 	return nil
 }
 
-// ExecutePlan processes and executes the plan with proper Docker SDK calls.
-// The client would call it with one string argument (the plan in JSON), and get a string reply:
-func (s *Server) ExecutePlan(args *string, reply *string) error {
+// ExecutePlan processes and executes the plan using the registered tool handlers.
+// It returns a full RPCResponse instead of a simple string.
+func (s *Server) ExecutePlan(args *string, reply *mcp.RPCResponse) error {
+	response := mcp.RPCResponse{
+		Version: mcp.JSONRPCVersion,
+	}
+
 	if args == nil || *args == "" {
-		return fmt.Errorf("ExecutePlan received empty plan")
+		response.Error = mcp.NewError(-32602, "ExecutePlan received empty plan")
+		*reply = response
+		return nil
 	}
 
 	log.Printf("[ExecutePlan] Received Plan: %s", *args)
@@ -188,13 +221,16 @@ func (s *Server) ExecutePlan(args *string, reply *string) error {
 	var plan []map[string]interface{}
 	if err := json.Unmarshal([]byte(*args), &plan); err != nil {
 		log.Printf("[ExecutePlan] Error unmarshalling JSON: %v", err)
-		log.Printf("[ExecutePlan] Raw Plan Received: %s", *args)
-		return fmt.Errorf("failed to parse plan JSON: %w", err)
+		response.Error = mcp.NewError(-32700, fmt.Sprintf("failed to parse plan JSON: %v", err))
+		*reply = response
+		return nil
 	}
 
 	if len(plan) == 0 {
 		log.Printf("[ExecutePlan] No actions found in plan")
-		return fmt.Errorf("received empty plan from LLM")
+		response.Error = mcp.NewError(-32602, "received empty plan from LLM")
+		*reply = response
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -205,117 +241,150 @@ func (s *Server) ExecutePlan(args *string, reply *string) error {
 
 		actionType, ok := action["action"].(string)
 		if !ok || actionType == "" {
-			log.Printf("[ExecutePlan] Invalid action format: %+v", action)
-			return fmt.Errorf("invalid action format")
+			response.Error = mcp.NewError(-32602, "invalid action format")
+			*reply = response
+			return nil
 		}
 
 		parameters, _ := action["parameters"].(map[string]interface{})
 
-		switch actionType {
-		case "create_network":
-			name, _ := parameters["name"].(string)
-			if name == "" {
-				return errors.New("missing network name")
+		if tool, exists := s.tools[actionType]; exists {
+			if err := tool.Handler(ctx, s, parameters); err != nil {
+				response.Error = mcp.NewError(-32000, fmt.Sprintf("failed to execute tool %s: %v", actionType, err))
+				*reply = response
+				return nil
 			}
-			_, err := s.dockerClient.NetworkCreate(ctx, name, network.CreateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to create network %s: %v", name, err)
-			}
-
-		case "create_container":
-			name, _ := parameters["name"].(string)
-			image, _ := parameters["image"].(string)
-			if name == "" || image == "" {
-				return errors.New("missing container name or image")
-			}
-
-			_, err := s.dockerClient.ContainerCreate(ctx, &container.Config{
-				Image: image,
-			}, nil, nil, nil, name)
-			if err != nil {
-				return fmt.Errorf("failed to create container %s: %v", name, err)
-			}
-		case "create_volume":
-			name, _ := parameters["name"].(string)
-			if name == "" {
-				return fmt.Errorf("invalid or missing name for create_volume action")
-			}
-			_, err := s.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: name})
-			if err != nil {
-				return fmt.Errorf("failed to create volume %s: %v", name, err)
-			}
-		case "run_container":
-			name, _ := parameters["name"].(string)
-			if name == "" {
-				return fmt.Errorf("invalid name for run_container")
-			}
-			if err := s.dockerClient.ContainerStart(ctx, name, container.StartOptions{}); err != nil {
-				return fmt.Errorf("failed to start container %s: %v", name, err)
-			}
-
-		default:
-			return fmt.Errorf("unknown action: %s", actionType)
+		} else {
+			response.Error = mcp.NewError(-32601, fmt.Sprintf("unknown action: %s", actionType))
+			*reply = response
+			return nil
 		}
 	}
 
-	*reply = `{"status": "success", "message": "Plan executed successfully"}`
+	result, err := json.Marshal(map[string]string{
+		"status":  "success",
+		"message": "Plan executed successfully",
+	})
+	if err != nil {
+		response.Error = mcp.NewError(-32000, fmt.Sprintf("failed to marshal result: %v", err))
+	} else {
+		response.Result = json.RawMessage(result)
+	}
+	*reply = response
 	return nil
 }
 
-// Helper functions (unchanged) ----------------------------------------------
-
-func parseContainerDetails(action map[string]interface{}) (string, string, error) {
-	name, ok := action["name"].(string)
-	if !ok || name == "" {
-		return "", "", errors.New("invalid or missing container name")
+// CallTool allows the client to directly invoke an individual tool.
+func (s *Server) CallTool(args *mcp.ToolCallArgs, reply *mcp.RPCResponse) error {
+	response := mcp.RPCResponse{
+		Version: mcp.JSONRPCVersion,
 	}
-	image, ok := action["image"].(string)
+	tool, exists := s.tools[args.ToolName]
+	if !exists {
+		response.Error = mcp.NewError(-32601, fmt.Sprintf("unknown tool: %s", args.ToolName))
+		*reply = response
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := tool.Handler(ctx, s, args.Parameters); err != nil {
+		response.Error = mcp.NewError(-32000, fmt.Sprintf("failed to execute tool %s: %v", args.ToolName, err))
+		*reply = response
+		return nil
+	}
+
+	result, err := json.Marshal(map[string]string{
+		"status":  "success",
+		"message": fmt.Sprintf("Tool %s executed successfully", args.ToolName),
+	})
+	if err != nil {
+		response.Error = mcp.NewError(-32000, fmt.Sprintf("failed to marshal result: %v", err))
+	} else {
+		response.Result = json.RawMessage(result)
+	}
+	*reply = response
+	return nil
+}
+
+// -----------------------------------------------------------------------------
+// Docker Operation Tool Handlers
+// -----------------------------------------------------------------------------
+
+func createNetworkHandler(ctx context.Context, s *Server, parameters map[string]interface{}) error {
+	name, _ := parameters["name"].(string)
+	if name == "" {
+		return fmt.Errorf("missing network name")
+	}
+	_, err := s.dockerClient.NetworkCreate(ctx, name, network.CreateOptions{})
+	return err
+}
+
+func createContainerHandler(ctx context.Context, s *Server, parameters map[string]interface{}) error {
+	name, _ := parameters["name"].(string)
+	image, _ := parameters["image"].(string)
+	if name == "" || image == "" {
+		return errors.New("missing container name or image")
+	}
+	_, err := s.dockerClient.ContainerCreate(ctx, &container.Config{
+		Image: image,
+	}, nil, nil, nil, name)
+	return err
+}
+
+func createVolumeHandler(ctx context.Context, s *Server, parameters map[string]interface{}) error {
+	name, _ := parameters["name"].(string)
+	if name == "" {
+		return fmt.Errorf("invalid or missing name for create_volume action")
+	}
+	_, err := s.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: name})
+	return err
+}
+
+func runContainerHandler(ctx context.Context, s *Server, parameters map[string]interface{}) error {
+	name, _ := parameters["name"].(string)
+	if name == "" {
+		return fmt.Errorf("invalid name for run_container")
+	}
+	return s.dockerClient.ContainerStart(ctx, name, container.StartOptions{})
+}
+
+func pullImageHandler(ctx context.Context, s *Server, parameters map[string]interface{}) error {
+	// Try to obtain "image" directly.
+	image, ok := parameters["image"].(string)
 	if !ok || image == "" {
-		return "", "", errors.New("invalid or missing container image")
-	}
-	return name, image, nil
-}
-
-func parseEnvironment(action map[string]interface{}) ([]string, error) {
-	var envList []string
-	if envVars, ok := action["environment"].(map[string]interface{}); ok {
-		for key, value := range envVars {
-			envList = append(envList, fmt.Sprintf("%s=%v", key, value))
+		// Otherwise, attempt to combine "name" and "tag"
+		name, nameOk := parameters["name"].(string)
+		tag, tagOk := parameters["tag"].(string)
+		if !nameOk || name == "" {
+			return fmt.Errorf("missing image name for pull_image")
 		}
-	}
-	return envList, nil
-}
-
-func parseVolumes(action map[string]interface{}) ([]string, error) {
-	var volumes []string
-	if volumeMappings, ok := action["volumes"].([]interface{}); ok {
-		for _, vol := range volumeMappings {
-			volStr, valid := vol.(string)
-			if !valid {
-				return nil, fmt.Errorf("invalid volume format: %v", vol)
-			}
-			volumes = append(volumes, volStr)
+		if !tagOk || tag == "" {
+			tag = "latest"
 		}
+		image = fmt.Sprintf("%s:%s", name, tag)
 	}
-	return volumes, nil
+
+	// Create a child context with a longer timeout for pulling the image.
+	pullCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	out, err := s.dockerClient.ImagePull(pullCtx, image, img.PullOptions{})
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	// Consume the output stream to ensure the pull completes.
+	_, err = io.Copy(io.Discard, out)
+	return err
 }
 
-func parseNetworks(action map[string]interface{}) ([]string, error) {
-	var networks []string
-	if networkNames, ok := action["networks"].([]interface{}); ok {
-		for _, nw := range networkNames {
-			netStr, valid := nw.(string)
-			if !valid {
-				return nil, fmt.Errorf("invalid network format: %v", nw)
-			}
-			networks = append(networks, netStr)
-		}
-	}
-	return networks, nil
-}
+// -----------------------------------------------------------------------------
+// JSON-RPC Server Setup and HTTP Adapter
+// -----------------------------------------------------------------------------
 
-// StartRPCServer starts an HTTP server on port :1234 that uses
-// net/rpc + JSON-RPC to serve methods of our Server type.
+// StartRPCServer starts an HTTP server on port :1234 that uses net/rpc+JSON-RPC.
 func StartRPCServer() {
 	srv, err := NewServer()
 	if err != nil {
@@ -325,7 +394,6 @@ func StartRPCServer() {
 	rpcServer := rpc.NewServer()
 
 	// Register the instance methods under the name "Server"
-	// so methods will be called as "Server.ListPrompts", "Server.CallLLM", etc.
 	if err := rpcServer.RegisterName("Server", srv); err != nil {
 		log.Fatalf("Failed to register RPC service: %v", err)
 	}
@@ -336,8 +404,6 @@ func StartRPCServer() {
 			http.Error(w, "JSON-RPC requires POST", http.StatusMethodNotAllowed)
 			return
 		}
-		// The net/rpc library uses an io.ReadWriteCloser for the codec.
-		// We wrap the request body (for reading) + response writer (for writing).
 		rpcServer.ServeCodec(jsonrpc.NewServerCodec(&httpReadWriteCloser{
 			r: r.Body,
 			w: w,
@@ -348,8 +414,7 @@ func StartRPCServer() {
 	log.Fatal(http.ListenAndServe(":1234", nil))
 }
 
-// httpReadWriteCloser is a simple shim to adapt an http request/response
-// into an io.ReadWriteCloser for net/rpc/jsonrpc.
+// httpReadWriteCloser adapts an HTTP request/response into an io.ReadWriteCloser.
 type httpReadWriteCloser struct {
 	r io.ReadCloser
 	w io.Writer
@@ -366,8 +431,35 @@ func (hrwc *httpReadWriteCloser) Close() error { return hrwc.r.Close() }
 // ----------------------------------------------------------------------------
 
 func main() {
-	StartRPCServer()
+	// Create a Docker client.
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Fatalf("Error creating Docker client: %v", err)
+	}
 
-	// Keep the main goroutine alive.
-	select {}
+	// Prepare context and input arguments for prompt generation.
+	ctx := context.Background()
+	args := map[string]string{
+		"name":       "my_project",
+		"containers": "[{\"name\": \"example_container\", \"image\": \"nginx:latest\"}]",
+	}
+
+	// Generate the system prompt using the GetPrompt function.
+	promptResult, err := mcp.GetPrompt(ctx, cli, "docker_compose", args)
+	if err != nil {
+		log.Fatalf("Error generating system prompt: %v", err)
+	}
+
+	// Log the generated prompt messages.
+	for _, msg := range promptResult.Messages {
+		log.Printf("System Prompt (role=%s):\n%s\n", msg.Role, msg.Content.Text)
+	}
+
+	// Start the RPC server.
+	// If you want to run the RPC server concurrently, you could launch it as a goroutine.
+	// Here, we simply call it directly (it blocks).
+	// StartRPCServer()
+
+	go StartRPCServer()
+	select {} // Block forever.
 }
