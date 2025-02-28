@@ -89,6 +89,36 @@ func (s *Server) RegisterService(service Service) {
 	service.RegisterTools(s)
 }
 
+// ListTools returns a slice of strings listing all registered tools.
+func (s *Server) listTools() []string {
+	var toolList []string
+	for _, tool := range s.tools {
+		toolList = append(toolList, fmt.Sprintf("%s: %s", tool.Name, tool.Description))
+	}
+	return toolList
+}
+
+// ListServices returns a slice of strings listing all registered services.
+func (s *Server) listServices() []string {
+	var serviceList []string
+	for _, svc := range s.services {
+		serviceList = append(serviceList, svc.Name())
+	}
+	return serviceList
+}
+
+// JSON-RPC method to list tools.
+func (s *Server) ListToolsRPC(args *struct{}, reply *[]string) error {
+	*reply = s.listTools()
+	return nil
+}
+
+// JSON-RPC method to list services.
+func (s *Server) ListServicesRPC(args *struct{}, reply *[]string) error {
+	*reply = s.listServices()
+	return nil
+}
+
 // DockerClient returns the Docker client instance.
 func (s *Server) DockerClient() *client.Client {
 	return s.dockerClient
@@ -252,6 +282,8 @@ func (hrwc *httpReadWriteCloser) Close() error { return hrwc.r.Close() }
 // StartRPCServer starts the JSON-RPC server on port 1234.
 func (s *Server) StartRPCServer() {
 	rpcServer := rpc.NewServer()
+	// All exported methods of Server (including our new ListToolsRPC and ListServicesRPC)
+	// are available via the JSON-RPC interface.
 	if err := rpcServer.RegisterName("Server", s); err != nil {
 		log.Fatalf("Failed to register RPC service: %v", err)
 	}
