@@ -134,20 +134,39 @@ func runContainerHandler(s *server.Server) server.ToolHandler {
 	}
 }
 
+func pullImage(ctx context.Context, s *server.Server, image string) error {
+	// Create a child context with a longer timeout for pulling the image.
+	pullCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	out, err := s.DockerClient().ImagePull(pullCtx, image, img.PullOptions{})
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	// Consume the output stream to ensure the pull completes.
+	_, err = io.Copy(io.Discard, out)
+	return err
+}
+
 func pullImageHandler(s *server.Server) server.ToolHandler {
-	return func(ctx context.Context, srv *server.Server, parameters map[string]interface{}) error {
-		image, ok := parameters["image"].(string)
-		if !ok || image == "" {
+	return func(ctx context.Context, s *server.Server, parameters map[string]interface{}) error {
+		// First, try to obtain "image" directly.
+		if image, ok := parameters["image"].(string); ok && image != "" {
+			// Use the provided image string.
+			return pullImage(ctx, s, image)
+		}
+
+		// Otherwise, attempt to combine "name" and "tag"
+		name, nameOk := parameters["name"].(string)
+		tag, tagOk := parameters["tag"].(string)
+		if !nameOk || name == "" {
 			return fmt.Errorf("missing image name for pull_image")
 		}
-		pullCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		defer cancel()
-		out, err := srv.DockerClient().ImagePull(pullCtx, image, img.PullOptions{})
-		if err != nil {
-			return err
+		if !tagOk || tag == "" {
+			tag = "latest"
 		}
-		defer out.Close()
-		_, err = io.Copy(io.Discard, out)
-		return err
+		image := fmt.Sprintf("%s:%s", name, tag)
+		return pullImage(ctx, s, image)
 	}
 }

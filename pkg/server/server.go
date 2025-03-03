@@ -3,6 +3,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -89,7 +90,7 @@ func (s *Server) RegisterService(service Service) {
 	service.RegisterTools(s)
 }
 
-// ListTools returns a slice of strings listing all registered tools.
+// listTools returns a slice of strings listing all registered tools.
 func (s *Server) listTools() []string {
 	var toolList []string
 	for _, tool := range s.tools {
@@ -98,7 +99,7 @@ func (s *Server) listTools() []string {
 	return toolList
 }
 
-// ListServices returns a slice of strings listing all registered services.
+// listServices returns a slice of strings listing all registered services.
 func (s *Server) listServices() []string {
 	var serviceList []string
 	for _, svc := range s.services {
@@ -107,15 +108,36 @@ func (s *Server) listServices() []string {
 	return serviceList
 }
 
-// JSON-RPC method to list tools.
+// ListToolsRPC is a JSON-RPC method to list available tools.
 func (s *Server) ListToolsRPC(args *struct{}, reply *[]string) error {
 	*reply = s.listTools()
 	return nil
 }
 
-// JSON-RPC method to list services.
+// ListServicesRPC is a JSON-RPC method to list registered services.
 func (s *Server) ListServicesRPC(args *struct{}, reply *[]string) error {
 	*reply = s.listServices()
+	return nil
+}
+
+// ProcessInstruction is a new JSON-RPC method that accepts a plain language instruction,
+// calls the LLM to convert it into a valid JSON plan, and then executes the plan.
+func (s *Server) ProcessInstruction(instruction *string, reply *mcp.RPCResponse) error {
+	log.Printf("[ProcessInstruction] Received instruction: %s", *instruction)
+
+	// Call LLM with the plain language instruction.
+	var plan string
+	if err := s.CallLLM(instruction, &plan); err != nil {
+		return fmt.Errorf("ProcessInstruction: failed to call LLM: %w", err)
+	}
+
+	log.Printf("[ProcessInstruction] Generated plan: %s", plan)
+
+	// Execute the generated plan.
+	if err := s.ExecutePlan(&plan, reply); err != nil {
+		return fmt.Errorf("ProcessInstruction: failed to execute plan: %w", err)
+	}
+
 	return nil
 }
 
@@ -124,16 +146,20 @@ func (s *Server) DockerClient() *client.Client {
 	return s.dockerClient
 }
 
-// CallLLM sends user input to the LLM and returns a generated plan.
+// CallLLM sends user input to the LLM and returns a generated JSON plan.
+// Note the use of llms.WithTools to pass the registered tools.
 func (s *Server) CallLLM(args *string, reply *string) error {
 	log.Printf("[CallLLM] Received user input: %s", *args)
 
-	var registeredTools []interface{}
+	var registeredTools []llms.Tool
 	for _, tool := range s.tools {
-		registeredTools = append(registeredTools, map[string]interface{}{
-			"name":        tool.Name,
-			"description": tool.Description,
-			"parameters":  tool.InputSchema,
+		registeredTools = append(registeredTools, llms.Tool{
+			Type: "function",
+			Function: &llms.FunctionDefinition{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  tool.InputSchema,
+			},
 		})
 	}
 
@@ -142,7 +168,7 @@ func (s *Server) CallLLM(args *string, reply *string) error {
 		llms.TextParts(llms.ChatMessageTypeSystem, utils.GetSystemPrompt()),
 	}
 
-	response, err := s.llm.GenerateContent(context.Background(), prompt, nil)
+	response, err := s.llm.GenerateContent(context.Background(), prompt, llms.WithTools(registeredTools))
 	if err != nil {
 		log.Printf("[CallLLM] OpenAI error: %v", err)
 		return fmt.Errorf("LLM API error: %w", err)
@@ -280,10 +306,11 @@ func (hrwc *httpReadWriteCloser) Write(p []byte) (int, error) { return hrwc.w.Wr
 func (hrwc *httpReadWriteCloser) Close() error { return hrwc.r.Close() }
 
 // StartRPCServer starts the JSON-RPC server on port 1234.
+// It supports both standard JSON-RPC requests and plain text prompts.
+// If the incoming request is not valid JSON-RPC, it is treated as a plain text instruction,
+// wrapped into a call to ProcessInstruction.
 func (s *Server) StartRPCServer() {
 	rpcServer := rpc.NewServer()
-	// All exported methods of Server (including our new ListToolsRPC and ListServicesRPC)
-	// are available via the JSON-RPC interface.
 	if err := rpcServer.RegisterName("Server", s); err != nil {
 		log.Fatalf("Failed to register RPC service: %v", err)
 	}
@@ -293,10 +320,37 @@ func (s *Server) StartRPCServer() {
 			http.Error(w, "JSON-RPC requires POST", http.StatusMethodNotAllowed)
 			return
 		}
-		rpcServer.ServeCodec(jsonrpc.NewServerCodec(&httpReadWriteCloser{
-			r: r.Body,
-			w: w,
-		}))
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request", http.StatusBadRequest)
+			return
+		}
+		// Try to unmarshal into a JSON-RPC request.
+		var req mcp.RPCRequest
+		if err := json.Unmarshal(data, &req); err == nil && req.Method != "" {
+			// Received a valid JSON-RPC request.
+			codec := jsonrpc.NewServerCodec(&httpReadWriteCloser{
+				r: io.NopCloser(bytes.NewBuffer(data)),
+				w: w,
+			})
+			rpcServer.ServeRequest(codec)
+		} else {
+			// Not a valid JSON-RPC request, so assume it's a plain text prompt.
+			instruction := string(data)
+			log.Printf("Received plain text instruction: %s", instruction)
+			var reply mcp.RPCResponse
+			if err := s.ProcessInstruction(&instruction, &reply); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			result, err := json.Marshal(reply)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(result)
+		}
 	})
 
 	log.Println("JSON-RPC server listening on port 1234 (POST /rpc)...")
