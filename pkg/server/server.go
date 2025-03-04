@@ -13,6 +13,7 @@ import (
 	"net/rpc"
 	"net/rpc/jsonrpc"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/client"
@@ -120,12 +121,49 @@ func (s *Server) ListServicesRPC(args *struct{}, reply *[]string) error {
 	return nil
 }
 
-// ProcessInstruction is a new JSON-RPC method that accepts a plain language instruction,
-// calls the LLM to convert it into a valid JSON plan, and then executes the plan.
+// ProcessInstruction is a JSON-RPC method that accepts a plain language instruction,
+// and if the instruction is a list query (tools or services), returns the list directly.
+// Otherwise, it selects the appropriate system prompt, calls CallLLM, and executes the plan.
 func (s *Server) ProcessInstruction(instruction *string, reply *mcp.RPCResponse) error {
 	log.Printf("[ProcessInstruction] Received instruction: %s", *instruction)
+	lowerInst := strings.ToLower(*instruction)
 
-	// Call LLM with the plain language instruction.
+	// If the query asks for services, return the list directly.
+	if utils.IsListServicesQuery(lowerInst) {
+		services := s.listServices()
+		res, err := json.Marshal(services)
+		if err != nil {
+			return fmt.Errorf("failed to marshal services list: %w", err)
+		}
+		*reply = mcp.RPCResponse{
+			Version: mcp.JSONRPCVersion,
+			Result:  json.RawMessage(res),
+		}
+		return nil
+	}
+
+	// If the query asks for tools, return the list directly.
+	if utils.IsListToolsQuery(lowerInst) {
+		tools := s.listTools()
+		res, err := json.Marshal(tools)
+		if err != nil {
+			return fmt.Errorf("failed to marshal tools list: %w", err)
+		}
+		*reply = mcp.RPCResponse{
+			Version: mcp.JSONRPCVersion,
+			Result:  json.RawMessage(res),
+		}
+		return nil
+	}
+	// Otherwise, use the universal system prompt.
+	universalPrompt := utils.GetSystemPrompt()
+	log.Printf("[ProcessInstruction] Using universal system prompt.")
+
+	// Set the override (even though GetSystemPrompt would return the universal prompt by default,
+	// we set it explicitly to be sure) and clear it after.
+	utils.SetSystemPromptOverride(universalPrompt)
+	defer utils.ClearSystemPromptOverride()
+
 	var plan string
 	if err := s.CallLLM(instruction, &plan); err != nil {
 		return fmt.Errorf("ProcessInstruction: failed to call LLM: %w", err)
@@ -133,7 +171,6 @@ func (s *Server) ProcessInstruction(instruction *string, reply *mcp.RPCResponse)
 
 	log.Printf("[ProcessInstruction] Generated plan: %s", plan)
 
-	// Execute the generated plan.
 	if err := s.ExecutePlan(&plan, reply); err != nil {
 		return fmt.Errorf("ProcessInstruction: failed to execute plan: %w", err)
 	}
@@ -147,7 +184,7 @@ func (s *Server) DockerClient() *client.Client {
 }
 
 // CallLLM sends user input to the LLM and returns a generated JSON plan.
-// Note the use of llms.WithTools to pass the registered tools.
+// It now handles both an array of actions and a single action (object) by wrapping the latter in an array.
 func (s *Server) CallLLM(args *string, reply *string) error {
 	log.Printf("[CallLLM] Received user input: %s", *args)
 
@@ -163,26 +200,54 @@ func (s *Server) CallLLM(args *string, reply *string) error {
 		})
 	}
 
+	// Build the prompt with the system prompt.
 	prompt := []llms.MessageContent{
 		llms.TextParts(llms.ChatMessageTypeHuman, *args),
 		llms.TextParts(llms.ChatMessageTypeSystem, utils.GetSystemPrompt()),
 	}
 
-	response, err := s.llm.GenerateContent(context.Background(), prompt, llms.WithTools(registeredTools))
+	// Use WithJSONMode() to get a pure JSON response.
+	response, err := s.llm.GenerateContent(context.Background(), prompt, llms.WithTools(registeredTools), llms.WithJSONMode())
 	if err != nil {
 		log.Printf("[CallLLM] OpenAI error: %v", err)
 		return fmt.Errorf("LLM API error: %w", err)
 	}
-
 	if len(response.Choices) == 0 {
 		log.Printf("[CallLLM] Empty response from LLM")
 		return fmt.Errorf("LLM returned an empty response")
 	}
 
-	var plan []map[string]interface{}
-	if err := json.Unmarshal([]byte(response.Choices[0].Content), &plan); err != nil {
+	rawContent := response.Choices[0].Content
+	log.Printf("[CallLLM] Raw LLM response: %q", rawContent)
+
+	// Sanitize the response by trimming whitespace.
+	sanitized := strings.TrimSpace(rawContent)
+	log.Printf("[CallLLM] Sanitized LLM response: %q", sanitized)
+
+	// Unmarshal into an interface{} first.
+	var raw interface{}
+	if err := json.Unmarshal([]byte(sanitized), &raw); err != nil {
 		log.Printf("[CallLLM] LLM response is not valid JSON: %v", err)
 		return fmt.Errorf("LLM returned invalid JSON: %w", err)
+	}
+
+	var plan []map[string]interface{}
+	// Check if raw is already an array.
+	switch v := raw.(type) {
+	case []interface{}:
+		// Convert each element to map[string]interface{}.
+		for _, elem := range v {
+			if m, ok := elem.(map[string]interface{}); ok {
+				plan = append(plan, m)
+			} else {
+				return fmt.Errorf("LLM returned an array with a non-object element")
+			}
+		}
+	case map[string]interface{}:
+		// Wrap the single object in an array.
+		plan = []map[string]interface{}{v}
+	default:
+		return fmt.Errorf("LLM returned JSON that is neither an object nor an array")
 	}
 
 	planBytes, err := json.Marshal(plan)
@@ -190,7 +255,6 @@ func (s *Server) CallLLM(args *string, reply *string) error {
 		log.Printf("[CallLLM] Failed to marshal plan: %v", err)
 		return fmt.Errorf("failed to marshal plan: %w", err)
 	}
-
 	*reply = string(planBytes)
 	log.Printf("[CallLLM] Returning JSON plan: %s", *reply)
 	return nil
@@ -232,6 +296,10 @@ func (s *Server) ExecutePlan(args *string, reply *mcp.RPCResponse) error {
 			response.Error = mcp.NewError(-32602, "invalid action format")
 			*reply = response
 			return nil
+		}
+		// Normalize the action name by stripping the "functions." prefix if present.
+		if strings.HasPrefix(actionType, "functions.") {
+			actionType = strings.TrimPrefix(actionType, "functions.")
 		}
 
 		parameters, _ := action["parameters"].(map[string]interface{})
