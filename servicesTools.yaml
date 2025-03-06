@@ -1,0 +1,138 @@
+services:
+  - name: Docker
+    tools:
+      - name: create_network
+        description: "Create a Docker network"
+        schema:
+          type: object
+          properties:
+            name:
+              type: string
+              description: "Name of the network"
+          required:
+            - name
+        handler: createNetworkHandler
+
+      - name: create_container
+        description: "Create a Docker container"
+        schema:
+          type: object
+          properties:
+            name:
+              type: string
+              description: "Name of the container"
+            image:
+              type: string
+              description: "Docker image to use"
+          required:
+            - name
+            - image
+        handler: createContainerHandler
+
+      - name: create_volume
+        description: "Create a Docker volume"
+        schema:
+          type: object
+          properties:
+            name:
+              type: string
+              description: "Name of the volume"
+          required:
+            - name
+        handler: createVolumeHandler
+
+      - name: run_container
+        description: "Run (start) a Docker container"
+        schema:
+          type: object
+          properties:
+            name:
+              type: string
+              description: "Name of the container"
+          required:
+            - name
+        handler: runContainerHandler
+
+      - name: pull_image
+        description: "Pull a Docker image"
+        schema:
+          type: object
+          properties:
+            image:
+              type: string
+              description: "Name of the image to pull"
+          required:
+            - image
+        handler: pullImageHandler
+
+  - name: Git
+    tools:
+      - name: git_init
+        description: "Initialize a new Git repository"
+        schema:
+          type: object
+          properties:
+            path:
+              type: string
+              description: "Path to initialize the repository"
+          required:
+            - path
+        handler: gitInitHandler
+
+      - name: git_status
+        description: "Get Git repository status"
+        schema:
+          type: object
+          properties:
+            path:
+              type: string
+              description: "Path of the repository"
+          required:
+            - path
+        handler: gitStatusHandler
+
+      - name: git_add
+        description: "Add files to staging"
+        schema:
+          type: object
+          properties:
+            path:
+              type: string
+              description: "Path of the repository"
+            files:
+              type: array
+              items:
+                type: string
+              description: "Files to add"
+          required:
+            - path
+            - files
+        handler: gitAddHandler
+
+      - name: git_commit
+        description: "Commit changes in Git repository"
+        schema:
+          type: object
+          properties:
+            path:
+              type: string
+              description: "Path of the repository"
+            message:
+              type: string
+              description: "Commit message"
+          required:
+            - path
+            - message
+        handler: gitCommitHandler
+
+      - name: git_diff
+        description: "Show Git diff"
+        schema:
+          type: object
+          properties:
+            path:
+              type: string
+              description: "Path of the repository"
+          required:
+            - path
+        handler: gitDiffHandler

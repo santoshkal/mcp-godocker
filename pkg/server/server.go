@@ -185,6 +185,30 @@ func (s *Server) DockerClient() *client.Client {
 
 // CallLLM sends user input to the LLM and returns a generated JSON plan.
 // It now handles both an array of actions and a single action (object) by wrapping the latter in an array.
+// invokeTool executes the tool and returns its output
+func (s *Server) invokeTool(functionCall *llms.FunctionCall) (string, error) {
+	tool, exists := s.tools[functionCall.Name]
+	if !exists {
+		return "", fmt.Errorf("Tool %s not found", functionCall.Name)
+	}
+
+	// Parse JSON arguments into a map
+	var params map[string]interface{}
+	if err := json.Unmarshal([]byte(functionCall.Arguments), &params); err != nil {
+		return "", fmt.Errorf("Invalid arguments for tool %s: %v", functionCall.Name, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := tool.Handler(ctx, s, params); err != nil {
+		return "", fmt.Errorf("error executing tool %s: %v", functionCall.Name, err)
+	}
+
+	return fmt.Sprintf("Tool %s executed successfully", functionCall.Name), nil
+}
+
+// Updated CallLLM function to handle ToolCalls
 func (s *Server) CallLLM(args *string, reply *string) error {
 	log.Printf("[CallLLM] Received user input: %s", *args)
 
@@ -200,18 +224,22 @@ func (s *Server) CallLLM(args *string, reply *string) error {
 		})
 	}
 
-	// Build the prompt with the system prompt.
 	prompt := []llms.MessageContent{
 		llms.TextParts(llms.ChatMessageTypeHuman, *args),
 		llms.TextParts(llms.ChatMessageTypeSystem, utils.GetSystemPrompt()),
 	}
 
-	// Use WithJSONMode() to get a pure JSON response.
-	response, err := s.llm.GenerateContent(context.Background(), prompt, llms.WithTools(registeredTools), llms.WithJSONMode())
+	response, err := s.llm.GenerateContent(
+		context.Background(),
+		prompt,
+		llms.WithTools(registeredTools),
+		llms.WithJSONMode(),
+	)
 	if err != nil {
 		log.Printf("[CallLLM] OpenAI error: %v", err)
 		return fmt.Errorf("LLM API error: %w", err)
 	}
+
 	if len(response.Choices) == 0 {
 		log.Printf("[CallLLM] Empty response from LLM")
 		return fmt.Errorf("LLM returned an empty response")
@@ -220,47 +248,28 @@ func (s *Server) CallLLM(args *string, reply *string) error {
 	rawContent := response.Choices[0].Content
 	log.Printf("[CallLLM] Raw LLM response: %q", rawContent)
 
-	// Sanitize the response by trimming whitespace.
-	sanitized := strings.TrimSpace(rawContent)
-	log.Printf("[CallLLM] Sanitized LLM response: %q", sanitized)
-
-	// Unmarshal into an interface{} first.
-	var raw interface{}
-	if err := json.Unmarshal([]byte(sanitized), &raw); err != nil {
-		log.Printf("[CallLLM] LLM response is not valid JSON: %v", err)
-		return fmt.Errorf("LLM returned invalid JSON: %w", err)
-	}
-
-	var plan []map[string]interface{}
-	// Check if raw is already an array.
-	switch v := raw.(type) {
-	case []interface{}:
-		// Convert each element to map[string]interface{}.
-		for _, elem := range v {
-			if m, ok := elem.(map[string]interface{}); ok {
-				plan = append(plan, m)
-			} else {
-				return fmt.Errorf("LLM returned an array with a non-object element")
+	toolCalls := response.Choices[0].ToolCalls
+	if len(toolCalls) > 0 {
+		for _, toolCall := range toolCalls {
+			if toolCall.FunctionCall != nil {
+				log.Printf("[Tool Invoked] Function: %s, Arguments: %s", toolCall.FunctionCall.Name, toolCall.FunctionCall.Arguments)
+				if result, err := s.invokeTool(toolCall.FunctionCall); err == nil {
+					*reply = result
+					return nil
+				} else {
+					log.Printf("[CallLLM] Tool invocation error: %v", err)
+				}
 			}
 		}
-	case map[string]interface{}:
-		// Wrap the single object in an array.
-		plan = []map[string]interface{}{v}
-	default:
-		return fmt.Errorf("LLM returned JSON that is neither an object nor an array")
+	} else {
+		*reply = rawContent
 	}
 
-	planBytes, err := json.Marshal(plan)
-	if err != nil {
-		log.Printf("[CallLLM] Failed to marshal plan: %v", err)
-		return fmt.Errorf("failed to marshal plan: %w", err)
-	}
-	*reply = string(planBytes)
-	log.Printf("[CallLLM] Returning JSON plan: %s", *reply)
 	return nil
 }
 
-// ExecutePlan processes the plan using the registered tool handlers.
+// In pkg/server/server.go
+
 func (s *Server) ExecutePlan(args *string, reply *mcp.RPCResponse) error {
 	response := mcp.RPCResponse{Version: mcp.JSONRPCVersion}
 	if args == nil || *args == "" {
@@ -271,10 +280,33 @@ func (s *Server) ExecutePlan(args *string, reply *mcp.RPCResponse) error {
 
 	log.Printf("[ExecutePlan] Received Plan: %s", *args)
 
-	var plan []map[string]interface{}
-	if err := json.Unmarshal([]byte(*args), &plan); err != nil {
+	// Unmarshal into an interface{} first.
+	var raw interface{}
+	if err := json.Unmarshal([]byte(*args), &raw); err != nil {
 		log.Printf("[ExecutePlan] Error unmarshalling JSON: %v", err)
 		response.Error = mcp.NewError(-32700, fmt.Sprintf("failed to parse plan JSON: %v", err))
+		*reply = response
+		return nil
+	}
+
+	var plan []map[string]interface{}
+	switch v := raw.(type) {
+	case []interface{}:
+		// Already an array: convert each element.
+		for _, elem := range v {
+			if m, ok := elem.(map[string]interface{}); ok {
+				plan = append(plan, m)
+			} else {
+				response.Error = mcp.NewError(-32700, "plan array contains non-object element")
+				*reply = response
+				return nil
+			}
+		}
+	case map[string]interface{}:
+		// Single object: wrap it into an array.
+		plan = []map[string]interface{}{v}
+	default:
+		response.Error = mcp.NewError(-32700, "plan JSON is neither an object nor an array")
 		*reply = response
 		return nil
 	}
