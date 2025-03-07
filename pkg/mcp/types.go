@@ -3,6 +3,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 )
@@ -55,4 +56,12 @@ func (e *RPCError) String() string {
 type ToolCallArgs struct {
 	ToolName   string                 `json:"tool_name"`
 	Parameters map[string]interface{} `json:"parameters"`
+}
+
+// ToolHandler is the function signature for tool handlers.
+type ToolHandler func(ctx context.Context, reg Registry, parameters map[string]interface{}) error
+
+// Registry defines the interface for registering tools.
+type Registry interface {
+	RegisterTool(name, description string, inputSchema map[string]interface{}, handler ToolHandler)
 }

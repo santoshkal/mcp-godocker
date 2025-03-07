@@ -5,6 +5,17 @@ import (
 	"sync"
 )
 
+// ExtractServiceName attempts to extract a service name from the input.
+func ExtractServiceName(input string) (string, bool) {
+	if strings.Contains(input, "docker") {
+		return "docker", true
+	}
+	if strings.Contains(input, "git") {
+		return "git", true
+	}
+	return "", false
+}
+
 var (
 	systemPromptOverride string
 	overrideLock         sync.Mutex

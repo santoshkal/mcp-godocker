@@ -1,5 +1,3 @@
-// pkg/server/server.go
-
 package server
 
 import (
@@ -21,8 +19,18 @@ import (
 	"github.com/tmc/langchaingo/llms/openai"
 
 	"santoshkal/mcp-godocker/pkg/mcp"
+	"santoshkal/mcp-godocker/pkg/reg"
 	"santoshkal/mcp-godocker/pkg/utils"
 )
+
+// RegisteredTool holds metadata and the handler for a tool.
+type RegisteredTool struct {
+	Name        string
+	Description string
+	InputSchema map[string]interface{}
+	Handler     mcp.ToolHandler
+	ServiceName string
+}
 
 // Service defines an interface for a service to register its tools.
 type Service interface {
@@ -30,18 +38,7 @@ type Service interface {
 	RegisterTools(s *Server)
 }
 
-// ToolHandler defines the function signature for tool execution.
-type ToolHandler func(ctx context.Context, s *Server, parameters map[string]interface{}) error
-
-// RegisteredTool holds metadata and the handler for a tool.
-type RegisteredTool struct {
-	Name        string
-	Description string
-	InputSchema map[string]interface{}
-	Handler     ToolHandler
-}
-
-// Server represents the composite server supporting multiple services.
+// Server represents the composite server and implements mcp.Registry.
 type Server struct {
 	dockerClient *client.Client
 	llm          *openai.LLM
@@ -49,13 +46,15 @@ type Server struct {
 	services     map[string]Service
 }
 
-// NewServer initializes a new Server instance.
+// Ensure Server implements mcp.Registry.
+var _ mcp.Registry = (*Server)(nil)
+
+// NewServer initializes a new Server instance and registers dynamic tools.
 func NewServer() (*Server, error) {
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		log.Printf("Docker client initialization failed: %v", err)
-		// Allow server initialization without Docker functionality.
-		dockerClient = nil
+		dockerClient = nil // Allow server initialization without Docker.
 	}
 
 	apiKey := os.Getenv("OPENAI_API_KEY")
@@ -67,16 +66,30 @@ func NewServer() (*Server, error) {
 		return nil, err
 	}
 
-	return &Server{
+	s := &Server{
 		dockerClient: dockerClient,
 		llm:          llm,
 		tools:        make(map[string]RegisteredTool),
 		services:     make(map[string]Service),
-	}, nil
+	}
+
+	// Dynamically load and register tools from YAML configuration.
+	homeDir := os.Getenv("HOME")
+	configPath := homeDir + "/mcp-godocker/servicesTools.yaml"
+	fmt.Printf("COnfig Path: %v\n", configPath)
+	if configPath == "" {
+		configPath = "config.yaml" // Default configuration file.
+	}
+	if err := reg.RegisterToolsFromConfig(s, configPath); err != nil {
+		log.Printf("failed to register dynamic tools from config: %v", err)
+		// Optionally, you can return the error if dynamic tools are critical.
+	}
+
+	return s, nil
 }
 
-// RegisterTool adds an individual tool to the server.
-func (s *Server) RegisterTool(name, description string, inputSchema map[string]interface{}, handler ToolHandler) {
+// RegisterTool implements the mcp.Registry interface.
+func (s *Server) RegisterTool(name, description string, inputSchema map[string]interface{}, handler mcp.ToolHandler) {
 	s.tools[name] = RegisteredTool{
 		Name:        name,
 		Description: description,
@@ -109,58 +122,55 @@ func (s *Server) listServices() []string {
 	return serviceList
 }
 
-// ListToolsRPC is a JSON-RPC method to list available tools.
-func (s *Server) ListToolsRPC(args *struct{}, reply *[]string) error {
-	*reply = s.listTools()
-	return nil
+// listToolsForService returns tools filtered by service name.
+func (s *Server) listToolsForService(serviceName string) []string {
+	var toolList []string
+	for _, tool := range s.tools {
+		if strings.ToLower(tool.ServiceName) == strings.ToLower(serviceName) {
+			toolList = append(toolList, fmt.Sprintf("%s: %s", tool.Name, tool.Description))
+		}
+	}
+	return toolList
 }
 
-// ListServicesRPC is a JSON-RPC method to list registered services.
-func (s *Server) ListServicesRPC(args *struct{}, reply *[]string) error {
-	*reply = s.listServices()
-	return nil
-}
-
-// ProcessInstruction is a JSON-RPC method that accepts a plain language instruction,
-// and if the instruction is a list query (tools or services), returns the list directly.
-// Otherwise, it selects the appropriate system prompt, calls CallLLM, and executes the plan.
+// ProcessInstruction handles a plain language instruction.
 func (s *Server) ProcessInstruction(instruction *string, reply *mcp.RPCResponse) error {
 	log.Printf("[ProcessInstruction] Received instruction: %s", *instruction)
 	lowerInst := strings.ToLower(*instruction)
 
-	// If the query asks for services, return the list directly.
+	// If the query asks for services, return the list.
 	if utils.IsListServicesQuery(lowerInst) {
 		services := s.listServices()
 		res, err := json.Marshal(services)
 		if err != nil {
 			return fmt.Errorf("failed to marshal services list: %w", err)
 		}
-		*reply = mcp.RPCResponse{
-			Version: mcp.JSONRPCVersion,
-			Result:  json.RawMessage(res),
-		}
+		*reply = mcp.RPCResponse{Version: mcp.JSONRPCVersion, Result: json.RawMessage(res)}
 		return nil
 	}
 
-	// If the query asks for tools, return the list directly.
+	// If the query asks for tools, optionally extract a service name.
 	if utils.IsListToolsQuery(lowerInst) {
+		if serviceName, found := utils.ExtractServiceName(lowerInst); found {
+			tools := s.listToolsForService(serviceName)
+			res, err := json.Marshal(tools)
+			if err != nil {
+				return fmt.Errorf("failed to marshal tools list: %w", err)
+			}
+			*reply = mcp.RPCResponse{Version: mcp.JSONRPCVersion, Result: json.RawMessage(res)}
+			return nil
+		}
 		tools := s.listTools()
 		res, err := json.Marshal(tools)
 		if err != nil {
 			return fmt.Errorf("failed to marshal tools list: %w", err)
 		}
-		*reply = mcp.RPCResponse{
-			Version: mcp.JSONRPCVersion,
-			Result:  json.RawMessage(res),
-		}
+		*reply = mcp.RPCResponse{Version: mcp.JSONRPCVersion, Result: json.RawMessage(res)}
 		return nil
 	}
-	// Otherwise, use the universal system prompt.
+
 	universalPrompt := utils.GetSystemPrompt()
 	log.Printf("[ProcessInstruction] Using universal system prompt.")
-
-	// Set the override (even though GetSystemPrompt would return the universal prompt by default,
-	// we set it explicitly to be sure) and clear it after.
 	utils.SetSystemPromptOverride(universalPrompt)
 	defer utils.ClearSystemPromptOverride()
 
@@ -170,7 +180,6 @@ func (s *Server) ProcessInstruction(instruction *string, reply *mcp.RPCResponse)
 	}
 
 	log.Printf("[ProcessInstruction] Generated plan: %s", plan)
-
 	if err := s.ExecutePlan(&plan, reply); err != nil {
 		return fmt.Errorf("ProcessInstruction: failed to execute plan: %w", err)
 	}
@@ -183,19 +192,16 @@ func (s *Server) DockerClient() *client.Client {
 	return s.dockerClient
 }
 
-// CallLLM sends user input to the LLM and returns a generated JSON plan.
-// It now handles both an array of actions and a single action (object) by wrapping the latter in an array.
-// invokeTool executes the tool and returns its output
+// invokeTool executes a tool based on the LLM function call.
 func (s *Server) invokeTool(functionCall *llms.FunctionCall) (string, error) {
 	tool, exists := s.tools[functionCall.Name]
 	if !exists {
 		return "", fmt.Errorf("Tool %s not found", functionCall.Name)
 	}
 
-	// Parse JSON arguments into a map
 	var params map[string]interface{}
 	if err := json.Unmarshal([]byte(functionCall.Arguments), &params); err != nil {
-		return "", fmt.Errorf("Invalid arguments for tool %s: %v", functionCall.Name, err)
+		return "", fmt.Errorf("invalid arguments for tool %s: %v", functionCall.Name, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -208,9 +214,9 @@ func (s *Server) invokeTool(functionCall *llms.FunctionCall) (string, error) {
 	return fmt.Sprintf("Tool %s executed successfully", functionCall.Name), nil
 }
 
-// Updated CallLLM function to handle ToolCalls
-func (s *Server) CallLLM(args *string, reply *string) error {
-	log.Printf("[CallLLM] Received user input: %s", *args)
+// CallLLM sends input to the LLM and returns a generated JSON plan.
+func (s *Server) CallLLM(input *string, reply *string) error {
+	log.Printf("[CallLLM] Received user input: %s", *input)
 
 	var registeredTools []llms.Tool
 	for _, tool := range s.tools {
@@ -225,9 +231,11 @@ func (s *Server) CallLLM(args *string, reply *string) error {
 	}
 
 	prompt := []llms.MessageContent{
-		llms.TextParts(llms.ChatMessageTypeHuman, *args),
+		llms.TextParts(llms.ChatMessageTypeHuman, *input),
 		llms.TextParts(llms.ChatMessageTypeSystem, utils.GetSystemPrompt()),
 	}
+
+	// log.Printf("[Combined Prompt] Prompt sent to LLM: %v", prompt)
 
 	response, err := s.llm.GenerateContent(
 		context.Background(),
@@ -268,21 +276,19 @@ func (s *Server) CallLLM(args *string, reply *string) error {
 	return nil
 }
 
-// In pkg/server/server.go
-
-func (s *Server) ExecutePlan(args *string, reply *mcp.RPCResponse) error {
+// ExecutePlan processes the JSON plan generated by the LLM.
+func (s *Server) ExecutePlan(planJSON *string, reply *mcp.RPCResponse) error {
 	response := mcp.RPCResponse{Version: mcp.JSONRPCVersion}
-	if args == nil || *args == "" {
+	if planJSON == nil || *planJSON == "" {
 		response.Error = mcp.NewError(-32602, "ExecutePlan received empty plan")
 		*reply = response
 		return nil
 	}
 
-	log.Printf("[ExecutePlan] Received Plan: %s", *args)
+	log.Printf("[ExecutePlan] Received Plan: %s", *planJSON)
 
-	// Unmarshal into an interface{} first.
 	var raw interface{}
-	if err := json.Unmarshal([]byte(*args), &raw); err != nil {
+	if err := json.Unmarshal([]byte(*planJSON), &raw); err != nil {
 		log.Printf("[ExecutePlan] Error unmarshalling JSON: %v", err)
 		response.Error = mcp.NewError(-32700, fmt.Sprintf("failed to parse plan JSON: %v", err))
 		*reply = response
@@ -292,7 +298,6 @@ func (s *Server) ExecutePlan(args *string, reply *mcp.RPCResponse) error {
 	var plan []map[string]interface{}
 	switch v := raw.(type) {
 	case []interface{}:
-		// Already an array: convert each element.
 		for _, elem := range v {
 			if m, ok := elem.(map[string]interface{}); ok {
 				plan = append(plan, m)
@@ -303,7 +308,6 @@ func (s *Server) ExecutePlan(args *string, reply *mcp.RPCResponse) error {
 			}
 		}
 	case map[string]interface{}:
-		// Single object: wrap it into an array.
 		plan = []map[string]interface{}{v}
 	default:
 		response.Error = mcp.NewError(-32700, "plan JSON is neither an object nor an array")
@@ -329,7 +333,6 @@ func (s *Server) ExecutePlan(args *string, reply *mcp.RPCResponse) error {
 			*reply = response
 			return nil
 		}
-		// Normalize the action name by stripping the "functions." prefix if present.
 		if strings.HasPrefix(actionType, "functions.") {
 			actionType = strings.TrimPrefix(actionType, "functions.")
 		}
@@ -406,9 +409,6 @@ func (hrwc *httpReadWriteCloser) Write(p []byte) (int, error) { return hrwc.w.Wr
 func (hrwc *httpReadWriteCloser) Close() error { return hrwc.r.Close() }
 
 // StartRPCServer starts the JSON-RPC server on port 1234.
-// It supports both standard JSON-RPC requests and plain text prompts.
-// If the incoming request is not valid JSON-RPC, it is treated as a plain text instruction,
-// wrapped into a call to ProcessInstruction.
 func (s *Server) StartRPCServer() {
 	rpcServer := rpc.NewServer()
 	if err := rpcServer.RegisterName("Server", s); err != nil {
@@ -425,17 +425,14 @@ func (s *Server) StartRPCServer() {
 			http.Error(w, "Failed to read request", http.StatusBadRequest)
 			return
 		}
-		// Try to unmarshal into a JSON-RPC request.
 		var req mcp.RPCRequest
 		if err := json.Unmarshal(data, &req); err == nil && req.Method != "" {
-			// Received a valid JSON-RPC request.
 			codec := jsonrpc.NewServerCodec(&httpReadWriteCloser{
 				r: io.NopCloser(bytes.NewBuffer(data)),
 				w: w,
 			})
 			rpcServer.ServeRequest(codec)
 		} else {
-			// Not a valid JSON-RPC request, so assume it's a plain text prompt.
 			instruction := string(data)
 			log.Printf("Received plain text instruction: %s", instruction)
 			var reply mcp.RPCResponse

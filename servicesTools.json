@@ -1,0 +1,100 @@
+services:
+  - name: Docker
+    enabled: true
+    tools:
+      - name: create_network
+        enabled: true
+        description: "Create a Docker network"
+        schema:
+          type: object
+          properties:
+            name:
+              type: string
+              description: "Name of the network"
+          required:
+            - name
+        script: |
+          import (
+              "context"
+              "fmt"
+              "github.com/docker/docker/api/types/network"
+              "santoshkal/mcp-godocker/pkg/server"
+          )
+          func Handler(ctx context.Context, s *server.Server, parameters map[string]interface{}) error {
+              name, _ := parameters["name"].(string)
+              if name == "" {
+                  return fmt.Errorf("missing network name")
+              }
+              _, err := s.DockerClient().NetworkCreate(ctx, name, network.CreateOptions{})
+              return err
+          }
+
+      - name: pull_image
+        enabled: true
+        description: "Pull a Docker image"
+        schema:
+          type: object
+          properties:
+            image:
+              type: string
+              description: "Name of the image to pull"
+          required:
+            - image
+        script: |
+          import (
+              "context"
+              "fmt"
+              "io"
+              "time"
+              img "github.com/docker/docker/api/types/image"
+              "santoshkal/mcp-godocker/pkg/server"
+          )
+          func Handler(ctx context.Context, s *server.Server, parameters map[string]interface{}) error {
+              image, ok := parameters["image"].(string)
+              if !ok || image == "" {
+                  return fmt.Errorf("missing image")
+              }
+              pullCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+              defer cancel()
+              out, err := s.DockerClient().ImagePull(pullCtx, image, img.PullOptions{})
+              if err != nil {
+                  return err
+              }
+              defer out.Close()
+              _, err = io.Copy(io.Discard, out)
+              return err
+          }
+
+  - name: Git
+    enabled: true
+    tools:
+      - name: git_init
+        enabled: true
+        description: "Initialize a new Git repository"
+        schema:
+          type: object
+          properties:
+            path:
+              type: string
+              description: "Path to initialize the repository"
+          required:
+            - path
+        script: |
+          import (
+              "context"
+              "fmt"
+              "os/exec"
+              "santoshkal/mcp-godocker/pkg/server"
+          )
+          func Handler(ctx context.Context, s *server.Server, parameters map[string]interface{}) error {
+              path, _ := parameters["path"].(string)
+              if path == "" {
+                  return fmt.Errorf("missing path")
+              }
+              cmd := exec.CommandContext(ctx, "git", "init", path)
+              output, err := cmd.CombinedOutput()
+              if err != nil {
+                  return fmt.Errorf("git init error: %s, output: %s", err, string(output))
+              }
+              return nil
+          }
