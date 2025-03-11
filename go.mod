@@ -1,4 +1,4 @@
-module santoshkal.com/mcp-godocker
+module github.com/santoshkal/mcp-godocker
 
 go 1.22.5
 

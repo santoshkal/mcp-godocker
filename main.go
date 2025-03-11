@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"santoshkal.com/mcp-godocker/pkg/server"
+	"github.com/santoshkal/mcp-godocker/pkg/server"
 )
 
 func main() {

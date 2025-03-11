@@ -18,9 +18,9 @@ import (
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/openai"
 
-	"santoshkal.com/mcp-godocker/pkg/mcp"
-	"santoshkal.com/mcp-godocker/pkg/reg"
-	"santoshkal.com/mcp-godocker/pkg/utils"
+	"github.com/santoshkal/mcp-godocker/pkg/mcp"
+	"github.com/santoshkal/mcp-godocker/pkg/reg"
+	"github.com/santoshkal/mcp-godocker/pkg/utils"
 )
 
 // Create a logger instance using logrus.
@@ -89,10 +89,10 @@ func NewServer() (*Server, error) {
 
 	// Dynamically load and register tools from YAML configuration.
 	homeDir := os.Getenv("HOME")
-	configPath := homeDir + "/mcp-godocker/config.yaml"
+	configPath := homeDir + "/mcp-godocker/plug.yaml"
 	logger.Infof("Config Path: %v", configPath)
 	if configPath == "" {
-		configPath = "config.yaml" // Default configuration file.
+		configPath = "plug.yaml" // Default configuration file.
 	}
 	if err := reg.RegisterToolsFromConfig(s, configPath); err != nil {
 		logger.Errorf("failed to register dynamic tools from config: %v", err)
