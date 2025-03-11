@@ -1,7 +1,9 @@
 services:
   - name: Docker
+    enabled: true
     tools:
       - name: create_network
+        enabled: true
         description: "Create a Docker network"
         schema:
           type: object
@@ -14,6 +16,7 @@ services:
         handler: createNetworkHandler
 
       - name: create_container
+        enabled: true
         description: "Create a Docker container"
         schema:
           type: object
@@ -30,6 +33,7 @@ services:
         handler: createContainerHandler
 
       - name: create_volume
+        enabled: true
         description: "Create a Docker volume"
         schema:
           type: object
@@ -42,6 +46,7 @@ services:
         handler: createVolumeHandler
 
       - name: run_container
+        enabled: true
         description: "Run (start) a Docker container"
         schema:
           type: object
@@ -54,6 +59,7 @@ services:
         handler: runContainerHandler
 
       - name: pull_image
+        enabled: true
         description: "Pull a Docker image"
         schema:
           type: object
@@ -66,8 +72,10 @@ services:
         handler: pullImageHandler
 
   - name: Git
+    enabled: true
     tools:
       - name: git_init
+        enabled: true
         description: "Initialize a new Git repository"
         schema:
           type: object
@@ -80,6 +88,7 @@ services:
         handler: gitInitHandler
 
       - name: git_status
+        enabled: true
         description: "Get Git repository status"
         schema:
           type: object
@@ -92,6 +101,7 @@ services:
         handler: gitStatusHandler
 
       - name: git_add
+        enabled: true
         description: "Add files to staging"
         schema:
           type: object
@@ -110,6 +120,7 @@ services:
         handler: gitAddHandler
 
       - name: git_commit
+        enabled: true
         description: "Commit changes in Git repository"
         schema:
           type: object
@@ -126,6 +137,7 @@ services:
         handler: gitCommitHandler
 
       - name: git_diff
+        enabled: true
         description: "Show Git diff"
         schema:
           type: object

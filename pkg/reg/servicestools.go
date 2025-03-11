@@ -1,15 +1,18 @@
 package reg
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"go/build"
 	"os"
 
+	_ "github.com/docker/docker/api/types/network"
 	"github.com/traefik/yaegi/interp"
 	"github.com/traefik/yaegi/stdlib"
 	"gopkg.in/yaml.v2"
 
-	"santoshkal/mcp-godocker/pkg/mcp"
+	"santoshkal.com/mcp-godocker/pkg/mcp"
 )
 
 // Config represents the overall YAML configuration.
@@ -62,14 +65,54 @@ func RegisterToolsFromConfig(r mcp.Registry, configPath string) error {
 			if !tool.Enabled {
 				continue
 			}
-
+			goPath := build.Default.GOPATH + "/pkg/mod"
+			// goPath := os.Getenv("GOPATH")
+			// if goPath == "" {
+			// 	goPath = "/go"
+			// }
+			fmt.Printf("GoPath: %v\n", goPath)
 			// Create a new yaegi interpreter instance.
-			i := interp.New(interp.Options{})
-			i.Use(stdlib.Symbols)
+			var stdout, stderr bytes.Buffer
+			i := interp.New(interp.Options{GoPath: goPath, Stdout: &stdout, Stderr: &stderr})
+			// i := interp.New(interp.Options{})
+			if err := i.Use(stdlib.Symbols); err != nil {
+				fmt.Printf("error loading package symbols: %v", err)
+			}
+			// if err := i.Use(interp.Symbols); err != nil {
+			// 	fmt.Printf("error loading exported symbols: %v", err)
+			// }
+			// _, err := i.Eval(`import (
+			// 	"github.com/docker/docker/api/types/network"
+			// 	"santoshkal.com/mcp-godocker/pkg/mcp"
+			// 	)`)
+			// if err != nil {
+			// 	fmt.Printf("error loading docker symbols: %v", err)
+			// }
+			// if _, err := i.Eval("import \"santoshkal/mcp-godocker/pkg/mcp\""); err != nil {
+			// 	fmt.Printf("error loading package symbols: %v", err)
+			// }
+			// if err := i.Use(interp.Exports{
+			// 	"santoshkal/mcp-godocker/pkg/mcp": {
+			// 		"Registry":    reflect.ValueOf((mcp.Registry)(nil)),
+			// 		"ToolHandler": reflect.ValueOf((mcp.ToolHandler)(nil)),
+			// 	},
+			// 	// If needed, also export symbols for third-party packages:
+			// }); err != nil {
+			// 	fmt.Printf("error loading package symbols: %v", err)
+			// }
+			// if err := i.Use(interp.Exports{
+			// 	"github.com/docker/docker/api/types/network": {
+			// 		// Export the symbols you need from the docker package, e.g.:
+			// 		"CreateOptions": reflect.ValueOf(network.CreateOptions{}),
+			// 	},
+			// }); err != nil {
+			// 	fmt.Printf("error loading package symbols: %v", err)
+			// }
 
+			// ImportUsed compiles and imports the used packages.
+			// i.ImportUsed()
 			// Evaluate the provided script. The script must define a function "Handler".
-			_, err := i.Eval(tool.Script)
-			if err != nil {
+			if _, err := i.Eval(tool.Script); err != nil {
 				return fmt.Errorf("failed to evaluate script for tool %s: %v", tool.Name, err)
 			}
 

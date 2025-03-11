@@ -1,0 +1,29 @@
+services:
+  - name: Docker
+    enabled: true
+    tools:
+      - name: create_network
+        enabled: true
+        description: "Create a Docker network"
+        schema:
+          type: object
+          properties:
+            name:
+              type: string
+              description: "Name of the network"
+          required:
+            - name
+        script: /home/a0557/plug/main.go
+
+      - name: pull_image
+        enabled: true
+        description: "Pull a Docker image"
+        schema:
+          type: object
+          properties:
+            image:
+              type: string
+              description: "Name of the image to pull"
+          required:
+            - image
+        script: /home/a0557/plug/main.go

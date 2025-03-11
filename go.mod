@@ -1,9 +1,10 @@
-module santoshkal/mcp-godocker
+module santoshkal.com/mcp-godocker
 
 go 1.22.5
 
 require (
 	github.com/docker/docker v27.5.1+incompatible
+	github.com/sirupsen/logrus v1.9.3
 	github.com/tmc/langchaingo v0.1.12
 	github.com/traefik/yaegi v0.16.1
 	gopkg.in/yaml.v2 v2.4.0
